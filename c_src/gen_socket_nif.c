@@ -84,6 +84,7 @@ struct socket {
   uint32_t events;
   int fd;
   int timeout;
+	void *resource;
 };
 
 
@@ -91,6 +92,7 @@ struct poll_thread {
   ErlNifEnv *env;
   ErlNifTid tid;
   ErlNifMutex *mutex;
+  ErlNifCond *cond;
   struct socket* sockets;
   int num;
   int sz;
@@ -98,24 +100,48 @@ struct poll_thread {
 };
 
 static poll_thread pt;
+
 #define GOTO_IF(label, ff) \
   do {\
-  if((ff)) {\
-    goto label;\
-  }\
-  while(0)
+  	if((ff)) {\
+  	  goto label;\
+  	}\
+	} while(0)
 
 static void poll_thread_run(void* _ctx);
+
 static int poll_thread_init(void) {
   GOTO_IF(error, 0 == (pt.env = enif_alloc_env()));
   GOTO_IF(error, 0 == (pt.mut = enif_mutex_create("gen_socket_poll_thread_mutex")));
+  GOTO_IF(error, 0 == (pt.cond = enif_cond_create("gen_socket_poll_thread_cond")));
   GOTO_IF(error, 0 != enif_thread_create("gen_socket_poll_thread",&pt.tid, poll_thread_run,0,0));
 error:
   return -1;
 }
+
 static int poll_thread_deinit(void) {
+  pt.exit = 1;
+  if(pt.cond) {
+    enif_cond_signal(pt.cond);
+  }
+	if(pt.tid) {
+  	if(0 != enif_thread_join(pt.tid, 0)) {
+			perror("enif_thread_join error\n");
+		}
+	}
+	if(pt.mut) {
+		enif_mutex_destroy(pt.mut);
+	}
+	if(pt.cond) {
+		enif_cond_destroy(pt.cond);
+	}
+	if(pt.env) {
+		enif_free_env(pt.env);
+	}
+	memset(&pt, 0, sizeof(pt));
 }
 
+ 
 static void poll_thread_run(void* _ctx) {
   struct socket *np;
   int epollfd;
@@ -159,14 +185,16 @@ static void poll_thread_run(void* _ctx) {
     for(i = 0; i < pt.num; ++j) {
       for(j = 0; j < nfds; ++i) {
         if(events[j].fd == pt.sockets[i].fd) {
-          term = enif_make_resource(pt.env, pt.socket[i].resource);
-          enif_release_resource(pt.socket[i].resource);
+          term = enif_make_ref(pt.env, pt.socket[i].ref);
           GOTO_IF(error, !enif_send(0, sockets.epid, pt.env, term));
         }
       }
     }
   }
 error:
+	if(!pt.exit) {
+		perror("gen_socket_poll_thread abnormal exit");
+	}
   pt.exit = 1;
   enif_mutex_unlock(&pt.mut);
   if(events) {
