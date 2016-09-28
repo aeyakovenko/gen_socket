@@ -80,6 +80,101 @@ static ERL_NIF_TERM atom_sock_err;
 
 static ErlNifResourceType *rsrc_sock;
 
+struct socket {
+  uint32_t events;
+  int fd;
+  int timeout;
+};
+
+
+struct poll_thread {
+  ErlNifEnv *env;
+  ErlNifTid tid;
+  ErlNifMutex *mutex;
+  struct socket* sockets;
+  int num;
+  int sz;
+  int exit;
+};
+
+static poll_thread pt;
+#define GOTO_IF(label, ff) \
+  do {\
+  if((ff)) {\
+    goto label;\
+  }\
+  while(0)
+
+static void poll_thread_run(void* _ctx);
+static int poll_thread_init(void) {
+  GOTO_IF(error, 0 == (pt.env = enif_alloc_env()));
+  GOTO_IF(error, 0 == (pt.mut = enif_mutex_create("gen_socket_poll_thread_mutex")));
+  GOTO_IF(error, 0 != enif_thread_create("gen_socket_poll_thread",&pt.tid, poll_thread_run,0,0));
+error:
+  return -1;
+}
+static int poll_thread_deinit(void) {
+}
+
+static void poll_thread_run(void* _ctx) {
+  struct socket *np;
+  int epollfd;
+	struct epoll_event *events = 0;
+  int sz = 0, num;
+  int i, j, nfds, timeout;
+  ERL_NIF_TERM term;
+  
+  enif_mutex_lock(&pt.mut);
+  GOTO_IF(error, -1 == (epollfd = epoll_create1(0)));
+  while(!pt.exit) {
+    num = pt.num;
+    if(num > sz || num < sz/2) {
+      GOTO_IF(error, 0 == (events = realloc(num*sizeof(events[0]))));
+      sz = num;
+    }
+    timeout = INT_MAX;
+    for(i = 0; i < num; ++i) {
+      if(pt.sockets[i].events) {
+        events[i].events = pt.sockets[i].events;
+        events[i].fd = pt.sockets[i].fd;
+	      GOTO_IF(error, -1 == epoll_ctl(epollfd, EPOLL_CTL_ADD, pt.sockets[i].fd, &events[i]));
+        if(-1 == pt.sockets[i].timeout) {
+          timeout = MIN(pt.sockets[i].timeout, timeout);
+        }
+        i++;
+      }
+    }
+    nfds = i;
+    if(INT_MAX == timeout) {
+      timeout = -1;
+    }
+    if(nfds > 0) {
+      enif_mutex_unlock(&pt.mut);
+	    nfds = epoll_wait(epollfd, events, nfds, timeout);
+      enif_mutex_lock(&pt.mut);
+    } else {
+      enif_cond_wait(&pt.cond, &pt.mut);
+    }
+    GOTO_IF(error, -1 == nfds);
+    for(i = 0; i < pt.num; ++j) {
+      for(j = 0; j < nfds; ++i) {
+        if(events[j].fd == pt.sockets[i].fd) {
+          term = enif_make_resource(pt.env, pt.socket[i].resource);
+          enif_release_resource(pt.socket[i].resource);
+          GOTO_IF(error, !enif_send(0, sockets.epid, pt.env, term));
+        }
+      }
+    }
+  }
+error:
+  pt.exit = 1;
+  enif_mutex_unlock(&pt.mut);
+  if(events) {
+    free(events);
+  }
+  return;
+}
+
 // -------------------------------------------------------------------------------------------------
 // -- MISC INTERNAL HELPER FUNCTIONS
 #define enif_get_ssize enif_get_long
@@ -1039,6 +1134,15 @@ nif_getfd(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
                             enif_make_int(env, *sock));
 }
 
+static ERL_NIF_TERM
+nif_readable(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
+{
+    int *sock;
+    if (!enif_get_resource(env, argv[0], rsrc_sock, (void**)&sock))
+        return enif_make_badarg(env);
+    return enif_make_tuple2(env, atom_ok,
+                            enif_make_int(env, *sock));
+}
 
 static ErlNifFunc nif_funcs[] = {
     {"nif_encode_sockaddr", 1, nif_encode_sockaddr},
@@ -1065,6 +1169,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_shutdown",        2, nif_shutdown},
     {"nif_close",           1, nif_close},
     {"nif_getfd",           1, nif_getfd},
+    {"nif_readable",        1, nif_readable},
 };
 
 ERL_NIF_INIT(gen_socket, nif_funcs, load, NULL, NULL, NULL)
